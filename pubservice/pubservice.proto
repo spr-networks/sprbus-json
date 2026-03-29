@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package pubservice;
 
-option go_package="http://github.com/spr-networks/sprbus/pubservice";
+option go_package="http://github.com/spr-networks/sprbus-json/pubservice";
  
 message String {
     string topic = 1;

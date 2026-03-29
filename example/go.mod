@@ -4,11 +4,11 @@ go 1.23.0
 
 toolchain go1.24.2
 
-replace github.com/spr-networks/sprbus v0.1.3 => ../
+replace github.com/spr-networks/sprbus-json v0.1.3 => ../
 
 require (
 	github.com/sirupsen/logrus v1.9.3
-	github.com/spr-networks/sprbus v0.1.7
+	github.com/spr-networks/sprbus-json v0.1.7
 )
 
 require (

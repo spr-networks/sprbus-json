@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/spr-networks/sprbus"
+	"github.com/spr-networks/sprbus-json"
 	//"github.com/spr-networks/sprbus/log"
 	"fmt"
 	"github.com/sirupsen/logrus"

@@ -3,7 +3,7 @@ package sprbus
 import (
 	"context"
 	"encoding/json"
-	pb "github.com/spr-networks/sprbus/pubservice"
+	pb "github.com/spr-networks/sprbus-json/pubservice"
 	"google.golang.org/grpc"
 	"io"
 	"os"

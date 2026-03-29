@@ -24,7 +24,7 @@ import (
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/spr-networks/sprbus"
+	"github.com/spr-networks/sprbus-json"
 	"github.com/tidwall/gjson"
 	"log"
 	"os"

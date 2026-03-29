@@ -10,7 +10,7 @@ require (
 	github.com/charmbracelet/glamour v0.10.0
 	github.com/charmbracelet/lipgloss v1.1.1-0.20250404203927-76690c660834
 	github.com/gorilla/websocket v1.5.3
-	github.com/spr-networks/sprbus v0.1.7
+	github.com/spr-networks/sprbus-json v0.1.7
 	github.com/tidwall/gjson v1.18.0
 )
 

@@ -1,4 +1,4 @@
-module github.com/spr-networks/sprbus
+module github.com/spr-networks/sprbus-json
 
 go 1.23.0
 

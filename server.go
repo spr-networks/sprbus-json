@@ -1,128 +1,153 @@
 package sprbus
 
 import (
-	"context"
-	"github.com/moby/pubsub"
-	pb "github.com/spr-networks/sprbus/pubservice"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/reflection"
+	"bufio"
+	"encoding/json"
 	"log"
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
-//defined in client.go
-//var ServerEventSock = "/tmp/grpc.sock"
-
 type Server struct {
-	path   string
-	server *grpc.Server
+	path     string
+	listener net.Listener
+	pub      *publisher
 }
 
-type PubsubService struct {
-	pb.UnimplementedPubsubServiceServer
-	pub *pubsub.Publisher
+// publisher is a simple in-process pub/sub (replaces github.com/moby/pubsub)
+type publisher struct {
+	mu   sync.RWMutex
+	subs map[*subscriber]struct{}
 }
 
-func (p *PubsubService) Publish(ctx context.Context, arg *pb.String) (*pb.String, error) {
-	msg := arg.GetTopic() + ":" + arg.GetValue()
-	//p.pub.Publish(arg.GetValue())
-	p.pub.Publish(msg)
-	return &pb.String{}, nil
+type subscriber struct {
+	ch     chan Message
+	filter func(Message) bool
 }
 
-func extractTopicAndValue(arg *pb.String, data string) (string, string) {
-
-	// get start of json message. object, array, string
-	index := strings.Index(data, "{")
-
-	if index < 0 {
-		index = strings.Index(data, "[")
-	}
-
-	if index < 0 {
-		index = strings.Index(data, "\"")
-	}
-
-	var topic string
-	var value string
-
-	// if not json object, just index at whatever topic is subscribed to
-	if index <= 0 {
-		topic = arg.GetTopic()
-		value = strings.TrimPrefix(data, topic+":")
-	} else {
-		topic = data[:index-1]
-		value = data[index:]
-	}
-
-	return topic, value
+func newPublisher() *publisher {
+	return &publisher{subs: make(map[*subscriber]struct{})}
 }
 
-func (p *PubsubService) SubscribeTopic(arg *pb.String, stream pb.PubsubService_SubscribeTopicServer) error {
-	ch := p.pub.SubscribeTopic(func(v interface{}) bool {
-		if key, ok := v.(string); ok {
-			if strings.HasPrefix(key, arg.GetTopic()) {
-				return true
+func (p *publisher) publish(msg Message) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for sub := range p.subs {
+		if sub.filter == nil || sub.filter(msg) {
+			select {
+			case sub.ch <- msg:
+			default:
+				// drop if subscriber is slow
 			}
 		}
-		return false
-	})
-
-	for v := range ch {
-		topic, value := extractTopicAndValue(arg, v.(string))
-		if err := stream.Send(&pb.String{Topic: topic, Value: value}); nil != err {
-			return err
-		}
 	}
-
-	return nil
 }
 
-func (p *PubsubService) Subscribe(arg *pb.String, stream pb.PubsubService_SubscribeServer) error {
-	ch := p.pub.Subscribe()
-	for v := range ch {
-		if err := stream.Send(&pb.String{Value: v.(string)}); nil != err {
-			return err
-		}
+func (p *publisher) subscribe(filter func(Message) bool) *subscriber {
+	sub := &subscriber{
+		ch:     make(chan Message, 64),
+		filter: filter,
 	}
-	return nil
+	p.mu.Lock()
+	p.subs[sub] = struct{}{}
+	p.mu.Unlock()
+	return sub
 }
 
-func NewPubsubService() *PubsubService {
-	return &PubsubService{pub: pubsub.NewPublisher(100*time.Millisecond, 10)}
+func (p *publisher) unsubscribe(sub *subscriber) {
+	p.mu.Lock()
+	delete(p.subs, sub)
+	p.mu.Unlock()
+	close(sub.ch)
 }
 
+// NewServer starts a pub/sub server on the given unix socket.
+// Protocol: newline-delimited JSON messages.
+//
+//	Client sends: {"topic":"...","value":"..."}  → publish
+//	Client sends: {"topic":"subscribe:..."}      → subscribe to topic prefix
+//	Server sends: {"topic":"...","value":"..."}  → event to subscribers
 func NewServer(socketPath string) (*Server, error) {
 	if socketPath == "" {
 		socketPath = ServerEventSock
 	}
 
 	os.Remove(socketPath)
-
 	lis, err := net.Listen("unix", socketPath)
-
 	if err != nil {
 		return nil, err
 	}
 
-	server := new(Server)
-	server.path = socketPath
-	server.server = grpc.NewServer()
-
-	// register grpcurl The required reflection service
-	reflection.Register(server.server)
-
-	// Register pubsub
-	pb.RegisterPubsubServiceServer(server.server, NewPubsubService())
-
-	//fmt.Println("starting grpc server...")
-
-	if err := server.server.Serve(lis); err != nil {
-		log.Fatalf("failed to serve: %v", err)
+	s := &Server{
+		path:     socketPath,
+		listener: lis,
+		pub:      newPublisher(),
 	}
 
-	return server, nil
+	go s.acceptLoop()
+
+	// small sleep to let the socket start accepting
+	time.Sleep(10 * time.Millisecond)
+
+	return s, nil
+}
+
+func (s *Server) acceptLoop() {
+	for {
+		conn, err := s.listener.Accept()
+		if err != nil {
+			return
+		}
+		go s.handleConn(conn)
+	}
+}
+
+func (s *Server) handleConn(conn net.Conn) {
+	defer conn.Close()
+	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 256*1024), 256*1024)
+
+	for scanner.Scan() {
+		var msg Message
+		if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
+			continue
+		}
+
+		if strings.HasPrefix(msg.Topic, "subscribe:") {
+			// Subscribe mode: filter by topic prefix, stream events back
+			prefix := strings.TrimPrefix(msg.Topic, "subscribe:")
+			sub := s.pub.subscribe(func(m Message) bool {
+				return strings.HasPrefix(m.Topic, prefix)
+			})
+			defer s.pub.unsubscribe(sub)
+
+			// Send events until connection closes
+			enc := json.NewEncoder(conn)
+			for ev := range sub.ch {
+				if err := enc.Encode(ev); err != nil {
+					return
+				}
+			}
+			return
+		}
+
+		// Publish mode
+		s.pub.publish(msg)
+	}
+}
+
+func (s *Server) Close() {
+	s.listener.Close()
+}
+
+// Serve blocks (like the original grpc server.Serve).
+// Call NewServer then Serve if you want blocking behavior.
+func (s *Server) Serve() error {
+	log.Printf("[sprbus] serving on %s", s.path)
+	// acceptLoop is already running in a goroutine from NewServer,
+	// block forever
+	select {}
 }

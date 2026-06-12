@@ -29,8 +29,21 @@ type publisher struct {
 
 type subscriber struct {
 	ch     chan event
+	quit   chan struct{}
+	once   sync.Once
 	filter func(string) bool
+	local  bool
 }
+
+func (s *subscriber) stop() {
+	s.once.Do(func() { close(s.quit) })
+}
+
+// a subscriber more than bufferSize behind gets evictTimeout of grace while
+// the bus blocks; past that a socket subscriber is disconnected (it can
+// reconnect), in-process subscribers are never dropped
+const bufferSize = 4096
+const evictTimeout = 5 * time.Second
 
 func newPublisher() *publisher {
 	return &publisher{subs: make(map[*subscriber]struct{})}
@@ -40,20 +53,41 @@ func (p *publisher) publish(ev event) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	for sub := range p.subs {
-		if sub.filter == nil || sub.filter(ev.topic) {
+		if sub.filter != nil && !sub.filter(ev.topic) {
+			continue
+		}
+		select {
+		case sub.ch <- ev:
+			continue
+		default:
+		}
+		// buffer full: block rather than drop
+		if sub.local {
 			select {
 			case sub.ch <- ev:
-			default:
-				// drop if subscriber is slow
+			case <-sub.quit:
 			}
+			continue
+		}
+		t := time.NewTimer(evictTimeout)
+		select {
+		case sub.ch <- ev:
+			t.Stop()
+		case <-sub.quit:
+			t.Stop()
+		case <-t.C:
+			log.Printf("[sprbus] disconnecting stalled subscriber")
+			sub.stop()
 		}
 	}
 }
 
-func (p *publisher) subscribe(filter func(string) bool) *subscriber {
+func (p *publisher) subscribe(filter func(string) bool, local bool) *subscriber {
 	sub := &subscriber{
-		ch:     make(chan event, 64),
+		ch:     make(chan event, bufferSize),
+		quit:   make(chan struct{}),
 		filter: filter,
+		local:  local,
 	}
 	p.mu.Lock()
 	p.subs[sub] = struct{}{}
@@ -65,7 +99,7 @@ func (p *publisher) unsubscribe(sub *subscriber) {
 	p.mu.Lock()
 	delete(p.subs, sub)
 	p.mu.Unlock()
-	close(sub.ch)
+	sub.stop()
 }
 
 // NewServer starts a pub/sub server on the given unix socket.
@@ -117,11 +151,16 @@ func (s *Server) HandleEvent(prefix string, callback func(topic string, value st
 func (s *Server) HandleEventRaw(prefix string, callback func(topic string, raw []byte)) func() {
 	sub := s.pub.subscribe(func(topic string) bool {
 		return strings.HasPrefix(topic, prefix)
-	})
+	}, true)
 
 	go func() {
-		for ev := range sub.ch {
-			callback(ev.topic, ev.raw)
+		for {
+			select {
+			case ev := <-sub.ch:
+				callback(ev.topic, ev.raw)
+			case <-sub.quit:
+				return
+			}
 		}
 	}()
 
@@ -158,24 +197,47 @@ func (s *Server) handleConn(conn net.Conn) {
 			prefix := strings.TrimPrefix(env.Topic, "subscribe:")
 			sub := s.pub.subscribe(func(topic string) bool {
 				return strings.HasPrefix(topic, prefix)
-			})
+			}, false)
 			defer s.pub.unsubscribe(sub)
 
 			// Send events until the connection closes; the original line
-			// is passed through, no re-encoding
+			// is passed through, no re-encoding. Queued events coalesce
+			// into a single flush to keep the drain faster than the bus.
 			w := bufio.NewWriter(conn)
-			for ev := range sub.ch {
+			for {
+				var ev event
+				select {
+				case ev = <-sub.ch:
+				case <-sub.quit:
+					return
+				}
 				if _, err := w.Write(ev.raw); err != nil {
 					return
 				}
 				if err := w.WriteByte('\n'); err != nil {
 					return
 				}
+			coalesce:
+				for {
+					select {
+					case more := <-sub.ch:
+						if _, err := w.Write(more.raw); err != nil {
+							return
+						}
+						if err := w.WriteByte('\n'); err != nil {
+							return
+						}
+					case <-sub.quit:
+						w.Flush()
+						return
+					default:
+						break coalesce
+					}
+				}
 				if err := w.Flush(); err != nil {
 					return
 				}
 			}
-			return
 		}
 
 		// Publish mode: the scanner reuses its buffer, so the line is

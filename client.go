@@ -80,7 +80,7 @@ func (c *Client) SubscribeTopic(topic string) (*Stream, error) {
 		return nil, err
 	}
 
-	return &Stream{scanner: bufio.NewScanner(c.conn)}, nil
+	return &Stream{r: bufio.NewReader(c.conn), max: 1024 * 1024}, nil
 }
 
 // Subscribe subscribes to all events (empty topic prefix).
@@ -90,21 +90,57 @@ func (c *Client) Subscribe(topic string) (*Stream, error) {
 
 // Stream mimics the gRPC streaming interface.
 type Stream struct {
-	scanner *bufio.Scanner
+	r   *bufio.Reader
+	max int
+}
+
+func readLine(r *bufio.Reader, max int) ([]byte, error) {
+	var line []byte
+	oversized := false
+	for {
+		chunk, err := r.ReadSlice('\n')
+		if !oversized {
+			line = append(line, chunk...)
+			if len(line) > max {
+				oversized, line = true, nil
+			}
+		}
+		switch err {
+		case nil:
+			if oversized {
+				return nil, nil
+			}
+			n := len(line)
+			if n > 0 && line[n-1] == '\n' {
+				n--
+				if n > 0 && line[n-1] == '\r' {
+					n--
+				}
+			}
+			return line[:n], nil
+		case bufio.ErrBufferFull:
+			continue
+		default:
+			return nil, err
+		}
+	}
 }
 
 func (s *Stream) Recv() (*Message, error) {
-	if !s.scanner.Scan() {
-		if err := s.scanner.Err(); err != nil {
+	for {
+		line, err := readLine(s.r, s.max)
+		if err != nil {
 			return nil, err
 		}
-		return nil, io.EOF
+		if line == nil {
+			continue
+		}
+		var msg Message
+		if err := json.Unmarshal(line, &msg); err != nil {
+			continue
+		}
+		return &msg, nil
 	}
-	var msg Message
-	if err := json.Unmarshal(s.scanner.Bytes(), &msg); err != nil {
-		return nil, fmt.Errorf("invalid message: %w", err)
-	}
-	return &msg, nil
 }
 
 // --- Package-level convenience functions (same signatures as original sprbus) ---

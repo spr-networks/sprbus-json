@@ -183,12 +183,18 @@ type envelope struct {
 
 func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
-	scanner := bufio.NewScanner(conn)
-	scanner.Buffer(make([]byte, 256*1024), 256*1024)
+	r := bufio.NewReader(conn)
 
-	for scanner.Scan() {
+	for {
+		line, err := readLine(r, 1024*1024)
+		if err != nil {
+			return
+		}
+		if line == nil {
+			continue
+		}
 		var env envelope
-		if err := json.Unmarshal(scanner.Bytes(), &env); err != nil {
+		if err := json.Unmarshal(line, &env); err != nil {
 			continue
 		}
 
@@ -240,11 +246,7 @@ func (s *Server) handleConn(conn net.Conn) {
 			}
 		}
 
-		// Publish mode: the scanner reuses its buffer, so the line is
-		// copied once here and shared by all subscribers
-		raw := make([]byte, len(scanner.Bytes()))
-		copy(raw, scanner.Bytes())
-		s.pub.publish(event{topic: env.Topic, raw: raw})
+		s.pub.publish(event{topic: env.Topic, raw: line})
 	}
 }
 
